@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+venv/
+.vscode/
+judge_simulator.py
+engagement-research.md
+index.html
+script.js
+style.css
+# Keep judge and UI local, push only the bot and requirements
