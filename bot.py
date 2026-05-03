@@ -179,18 +179,27 @@ def score_trigger_priority(trigger: Dict, merchant: Dict) -> float:
 # MESSAGE COMPOSER (the core intelligence)
 # ─────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are Vera, magicpin's merchant AI assistant. You message Indian merchants over WhatsApp.
+SYSTEM_PROMPT = """You are Vera, magicpin's elite merchant AI assistant messaging Indian merchants over WhatsApp.
 
-STRICT RULES:
-1. Be specific: use real numbers, dates, and facts from the context. Never say "10% off" when a service+price exists.
-2. Match the category voice: dentists=clinical/peer, salons=warm/practical, restaurants=operator-to-operator, gyms=coaching, pharmacies=trustworthy/precise.
-3. Use Hindi-English mix (code-mix) if merchant's languages include "hi". Match their language preference.
-4. Single CTA at the end: binary YES/STOP for action triggers, open-ended question for info, none for pure information.
-5. No URLs in message body (Meta will reject).
-6. No preamble: never say "I hope you're doing well" or re-introduce yourself.
-7. Keep it short: 60-100 words is ideal. Be direct.
-8. NEVER fabricate data: if a fact isn't in the context, don't invent it.
-9. Return ONLY valid JSON, no markdown, no explanation.
+STRICT RULES TO MAXIMIZE QUALITY:
+1. EXTREME SPECIFICITY (CRITICAL): You must weave in exact numbers, exact offer prices (e.g., "₹299 cleaning", not "discount"), exact metrics (e.g., "50% drop", "124 high-risk adults"), and exact dates. Do not generalize. If a specific stat or payload exists, YOU MUST USE IT.
+2. ENGAGEMENT COMPULSION (CRITICAL): Force engagement by framing the message using ONE distinct psychological lever:
+   - Loss Aversion: "You are missing out on X bookings compared to your peers..."
+   - Social Proof: "Top merchants in your area are seeing Y..."
+   - Effort Externalization: "I have already analyzed this and drafted the campaign. Just reply YES to activate."
+   - Curiosity: "Do you know why your views dropped yesterday?"
+3. CATEGORY FIT (CRITICAL): Embody the persona completely:
+   - dentists: clinical, peer-reviewed, scientific, use "Dr."
+   - salons: warm, practical, trend-focused
+   - restaurants: fast-paced, operator-to-operator, focus on table turns
+   - gyms: coaching, energetic, results-driven
+   - pharmacies: precise, trustworthy, fast
+4. MERCHANT FIT (CRITICAL): Prove you know them. Mention their exact locality, their past review themes (e.g., "customers love your ambiance"), or their specific active offers.
+5. NO PREAMBLE: Never say "I hope you're doing well" or re-introduce yourself. Start with the hook immediately.
+6. SINGLE STRONG CTA: End with one clear action: a binary YES/NO, or an open-ended question.
+7. LANGUAGE: Use Hindi-English mix (code-mix) only if the merchant's languages include "hi".
+8. NEVER fabricate data: use only provided context.
+9. Return ONLY valid JSON, no markdown.
 
 OUTPUT FORMAT (strict JSON):
 {
@@ -219,7 +228,14 @@ def build_compose_prompt(category: Dict, merchant: Dict, trigger: Dict, customer
         last_turns = "\n".join([f"  [{t['from'].upper()}] {t['body'][:120]}" for t in conv_hist[-3:]])
 
     # Build trigger summary
-    payload = trigger.get("payload", {})
+    payload = trigger.get("payload", {}).copy()
+    if trigger.get("kind") == "perf_dip" and "delta_pct" in payload:
+        try:
+            val = float(payload["delta_pct"])
+            payload["delta_pct"] = f"{abs(val) * 100:.1f}%"
+        except (ValueError, TypeError):
+            pass
+
     trig_summary = f"Kind: {trigger.get('kind')} | Urgency: {trigger.get('urgency')}/5 | Payload: {json.dumps(payload)[:400]}"
 
     # Build customer section
@@ -260,7 +276,11 @@ Recent conversation:
 === CUSTOMER (if any) ===
 {cust_section}
 
-Now compose the best possible message. Use the compulsion levers: specificity, loss aversion, social proof, effort externalization, curiosity, or a single binary CTA. Do NOT fabricate data."""
+Now compose the best possible message. 
+- You MUST use the compulsion levers: specificity, loss aversion, social proof, effort externalization, or curiosity. 
+- You MUST include exact numbers from the trigger payload or performance stats.
+- You MUST adopt the category voice perfectly.
+- Do NOT fabricate data."""
 
 
 def compose_message(category: Dict, merchant: Dict, trigger: Dict, customer: Optional[Dict] = None) -> Dict:
@@ -311,6 +331,71 @@ def _fallback_compose(merchant: Dict, trigger: Dict) -> Dict:
 # REPLY HANDLER
 # ─────────────────────────────────────────────────────────────────
 
+CUSTOMER_REPLY_SYSTEM = """You are an AI assistant replying on behalf of a local merchant directly to a customer on WhatsApp.
+
+RULES:
+1. Speak as the merchant (or their helpful assistant) answering the customer.
+2. Acknowledge their message (e.g., confirm booking, answer question).
+3. Be polite, warm, and extremely concise (under 50 words).
+4. Do NOT address the merchant. Address the customer.
+5. Return ONLY valid JSON, no markdown.
+
+OUTPUT FORMAT:
+{
+  "action": "<send | wait | end>",
+  "body": "<message text — only if action=send>",
+  "cta": "<none | open_ended>",
+  "wait_seconds": <number — only if action=wait>,
+  "rationale": "<1 sentence why>"
+}"""
+
+def _handle_customer_reply(conv: Dict, merchant_id: str, customer_id: Optional[str], message: str, turn: int) -> Dict:
+    merchant = get_context("merchant", merchant_id) or {}
+    customer = get_context("customer", customer_id) if customer_id else {}
+    
+    merchant_name = merchant.get("identity", {}).get("name", "the merchant")
+    customer_name = customer.get("identity", {}).get("name", "Customer")
+    
+    history_text = "\n".join([
+        f"  [{h['role'].upper()} T{h['turn']}] {h['body'][:100]}"
+        for h in conv.get("history", [])[-5:]
+    ])
+
+    prompt = f"""CUSTOMER REPLY — decide how to respond:
+
+Merchant: {merchant_name}
+Customer: {customer_name}
+Turn: {turn}
+
+Conversation so far:
+{history_text or '  (start of conversation)'}
+
+LATEST CUSTOMER MESSAGE (turn {turn}):
+"{message}"
+
+Compose a reply to the customer on behalf of {merchant_name}. Address the customer directly."""
+
+    raw = call_llm(prompt, CUSTOMER_REPLY_SYSTEM)
+
+    try:
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            result = json.loads(match.group())
+            if result.get("action") == "send" and result.get("body"):
+                conv["history"].append({"role": "merchant_on_behalf", "turn": turn + 1, "body": result["body"]})
+            return result
+    except Exception:
+        pass
+
+    fallback_body = "Thanks for reaching out! We've received your message and will get back to you shortly."
+    conv["history"].append({"role": "merchant_on_behalf", "turn": turn + 1, "body": fallback_body})
+    return {
+        "action": "send",
+        "body": fallback_body,
+        "cta": "none",
+        "rationale": "Fallback customer reply."
+    }
+
 REPLY_SYSTEM = """You are Vera, magicpin's merchant AI assistant responding to a WhatsApp reply.
 
 RULES:
@@ -354,7 +439,7 @@ Choose: send (reply with content), wait (back off N seconds), or end (close conv
 
 
 def handle_reply(conv_id: str, merchant_id: str, customer_id: Optional[str],
-                 message: str, turn: int) -> Dict:
+                 message: str, turn: int, from_role: str = "merchant") -> Dict:
     """Decide how to respond to a merchant/customer reply."""
 
     # Get or create conversation
@@ -372,9 +457,13 @@ def handle_reply(conv_id: str, merchant_id: str, customer_id: Optional[str],
     if conv.get("suppressed"):
         return {"action": "end", "rationale": "Conversation was previously suppressed (opt-out or ended)."}
 
+    conv["history"].append({"role": from_role, "turn": turn, "body": message})
+
+    if from_role == "customer":
+        return _handle_customer_reply(conv, merchant_id, customer_id, message, turn)
+
     # Detect intent
     intent = detect_intent(message)
-    conv["history"].append({"role": "merchant", "turn": turn, "body": message})
 
     # ── Hostile → end immediately
     if intent == "hostile":
@@ -482,7 +571,7 @@ def metadata():
     return {
         "team_name":    TEAM_NAME,
         "team_members": TEAM_MEMBERS,
-        "model":        f"gemini/{GEMINI_MODEL}",
+        "model":        f"groq/{GROQ_MODEL}",
         "approach":     "Gemini-powered single-prompt composer with trigger-kind routing, auto-reply detection, and intent-transition handling.",
         "contact_email": CONTACT_EMAIL,
         "version":      BOT_VERSION,
@@ -604,8 +693,9 @@ async def reply(request: Request):
     customer_id = body.get("customer_id")
     message     = body.get("message", "")
     turn        = body.get("turn_number", 2)
+    from_role   = body.get("from_role", "merchant")
 
-    result = handle_reply(conv_id, merchant_id, customer_id, message, turn)
+    result = handle_reply(conv_id, merchant_id, customer_id, message, turn, from_role)
     return result
 
 
